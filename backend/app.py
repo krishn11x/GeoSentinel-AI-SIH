@@ -1,268 +1,1646 @@
 from __future__ import annotations
-import io, math, uuid
+
+import math
+import uuid
 from datetime import date
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import numpy as np
 import requests
+import rasterio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
+from rasterio.enums import Resampling
+from rasterio.windows import from_bounds
+from rasterio.warp import transform_bounds
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 STAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
 SAS = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
-DATA = "https://planetarycomputer.microsoft.com/api/data/v1"
+
 CACHE = Path(__file__).parent / "cache"
 CACHE.mkdir(exist_ok=True)
 
-app = FastAPI(title="GeoSentinel AI", version="2.0")
+ANALYSIS_SIZE = 512
+
+SESSION = requests.Session()
+
+app = FastAPI(
+    title="GeoSentinel AI",
+    version="2.1"
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+
+# ============================================================
+# REQUEST MODELS
+# ============================================================
 
 class SearchBody(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lon: float = Field(..., ge=-180, le=180)
     radius_km: float = Field(5, gt=0, le=50)
+
     start: date
     end: date
+
     cloud: float = Field(20, ge=0, le=100)
+
 
 class AnalyzeBody(BaseModel):
     before_id: str
     after_id: str
+
     query: str
+
     lat: float
     lon: float
+
     radius_km: float
 
-def bbox(lat, lon, km):
+
+# ============================================================
+# GEOGRAPHIC HELPERS
+# ============================================================
+
+def make_bbox(lat: float, lon: float, km: float):
+    """
+    Create an approximate WGS84 bounding box around the AOI.
+    """
+
     dlat = km / 111.32
-    dlon = km / (111.32 * max(0.1, math.cos(math.radians(lat))))
-    return [lon-dlon, lat-dlat, lon+dlon, lat+dlat]
+
+    dlon = km / (
+        111.32 *
+        max(0.1, math.cos(math.radians(lat)))
+    )
+
+    return [
+        lon - dlon,
+        lat - dlat,
+        lon + dlon,
+        lat + dlat
+    ]
+
+
+# ============================================================
+# HTTP HELPERS
+# ============================================================
 
 def get_json(url, **kwargs):
-    r = requests.get(url, timeout=90, **kwargs)
-    r.raise_for_status()
-    return r.json()
+
+    response = SESSION.get(
+        url,
+        timeout=90,
+        **kwargs
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
 
 def post_json(url, payload):
-    r = requests.post(url, json=payload, timeout=90)
-    r.raise_for_status()
-    return r.json()
+
+    response = SESSION.post(
+        url,
+        json=payload,
+        timeout=90
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "data_source": "Microsoft Planetary Computer / Sentinel-2 L2A"}
+
+    return {
+        "ok": True,
+        "data_source": "Microsoft Planetary Computer / Sentinel-2 L2A",
+        "analysis_mode": "AOI windowed raster processing"
+    }
+
+
+# ============================================================
+# STAC SEARCH
+# ============================================================
 
 @app.post("/api/search")
 def search(b: SearchBody):
+
+    print("\n[SEARCH] Searching Sentinel-2 scenes...", flush=True)
+
+    aoi_bbox = make_bbox(
+        b.lat,
+        b.lon,
+        b.radius_km
+    )
+
     payload = {
-        "collections": ["sentinel-2-l2a"],
-        "bbox": bbox(b.lat, b.lon, b.radius_km),
-        "datetime": f"{b.start}T00:00:00Z/{b.end}T23:59:59Z",
+        "collections": [
+            "sentinel-2-l2a"
+        ],
+
+        "bbox": aoi_bbox,
+
+        "datetime":
+            f"{b.start}T00:00:00Z/"
+            f"{b.end}T23:59:59Z",
+
         "limit": 24,
-        "query": {"eo:cloud_cover": {"lt": b.cloud}},
-        "sortby": [{"field": "datetime", "direction": "desc"}]
+
+        "query": {
+            "eo:cloud_cover": {
+                "lt": b.cloud
+            }
+        },
+
+        "sortby": [
+            {
+                "field": "datetime",
+                "direction": "desc"
+            }
+        ]
     }
+
     try:
-        data = post_json(f"{STAC}/search", payload)
+
+        data = post_json(
+            f"{STAC}/search",
+            payload
+        )
+
     except Exception as e:
-        raise HTTPException(502, f"STAC search failed: {e}")
 
-    out = []
-    for x in data.get("features", []):
-        p = x.get("properties", {})
-        a = x.get("assets", {})
-        preview = (a.get("rendered_preview") or a.get("thumbnail") or {}).get("href")
-        out.append({
-            "id": x["id"],
-            "datetime": p.get("datetime"),
-            "cloud": p.get("eo:cloud_cover"),
-            "bbox": x.get("bbox"),
-            "geometry": x.get("geometry"),
-            "preview": preview,
-            "assets": list(a.keys())
+        print(f"[SEARCH ERROR] {e}", flush=True)
+
+        raise HTTPException(
+            502,
+            f"STAC search failed: {e}"
+        )
+
+    output = []
+
+    for scene in data.get("features", []):
+
+        properties = scene.get(
+            "properties",
+            {}
+        )
+
+        assets = scene.get(
+            "assets",
+            {}
+        )
+
+        preview = (
+            assets.get("rendered_preview")
+            or assets.get("thumbnail")
+            or {}
+        ).get("href")
+
+        output.append({
+
+            "id":
+                scene["id"],
+
+            "datetime":
+                properties.get("datetime"),
+
+            "cloud":
+                properties.get(
+                    "eo:cloud_cover"
+                ),
+
+            "bbox":
+                scene.get("bbox"),
+
+            "geometry":
+                scene.get("geometry"),
+
+            "preview":
+                preview,
+
+            "assets":
+                list(assets.keys())
+
         })
-    return {"scenes": out, "bbox": payload["bbox"], "query": payload}
 
-def item(item_id):
-    return get_json(f"{STAC}/collections/sentinel-2-l2a/items/{item_id}")
+    print(
+        f"[SEARCH] Found {len(output)} scenes",
+        flush=True
+    )
 
-def sign(href):
+    return {
+
+        "scenes": output,
+
+        "bbox": aoi_bbox,
+
+        "query": payload
+
+    }
+
+
+# ============================================================
+# GET COMPLETE STAC ITEM
+# ============================================================
+
+def get_item(item_id: str):
+
+    print(
+        f"[ITEM] Loading metadata: {item_id}",
+        flush=True
+    )
+
+    return get_json(
+        f"{STAC}/collections/"
+        f"sentinel-2-l2a/items/{item_id}"
+    )
+
+
+# ============================================================
+# SIGN PLANETARY COMPUTER ASSET
+# ============================================================
+
+def sign_asset(href: str):
+
     if "blob.core.windows.net" not in href:
         return href
-    return get_json(SAS, params={"href": href})["href"]
 
-def asset_bytes(it, key):
-    a = it.get("assets", {}).get(key)
-    if not a: return None
-    href = sign(a["href"])
-    r = requests.get(href, timeout=240)
-    r.raise_for_status()
-    return r.content
+    print(
+        "[ASSET] Signing Planetary Computer asset...",
+        flush=True
+    )
 
-def band(content, size=(1024,1024)):
-    import rasterio
-    with rasterio.open(io.BytesIO(content)) as ds:
-        x = ds.read(1).astype(np.float32)
-    x = cv2.resize(x, size, interpolation=cv2.INTER_AREA)
-    return x
+    data = get_json(
+        SAS,
+        params={
+            "href": href
+        }
+    )
 
-def stretch(x):
-    valid = x[x > 0]
-    lo, hi = (np.percentile(valid,2), np.percentile(valid,98)) if valid.size else (0,1)
-    return np.clip((x-lo)/max(hi-lo,1e-6),0,1)
+    return data["href"]
 
-def rgb(it):
-    chans = []
-    for k in ["B04","B03","B02"]:
-        c = asset_bytes(it,k)
-        if c is None: return None
-        chans.append(stretch(band(c)))
-    return (np.stack(chans,-1)*255).astype(np.uint8)
 
-def ndvi(it):
-    n, r = asset_bytes(it,"B08"), asset_bytes(it,"B04")
-    if n is None or r is None: return None
-    N, R = band(n), band(r)
-    return (N-R)/(N+R+1e-6)
+# ============================================================
+# READ ONLY AOI FROM REMOTE COG
+# ============================================================
 
-def align_and_change(a,b):
-    ag = cv2.cvtColor(a,cv2.COLOR_RGB2GRAY)
-    bg = cv2.cvtColor(b,cv2.COLOR_RGB2GRAY)
-    warp = np.eye(2,3,dtype=np.float32)
+def read_band_window(
+    item_data,
+    band_name,
+    aoi_bbox,
+    size=ANALYSIS_SIZE
+):
+    """
+    IMPORTANT:
+
+    This does NOT download the entire Sentinel-2 GeoTIFF.
+
+    Rasterio/GDAL performs HTTP range reads and requests
+    only the geographic AOI required for analysis.
+    """
+
+    asset = (
+        item_data
+        .get("assets", {})
+        .get(band_name)
+    )
+
+    if not asset:
+
+        print(
+            f"[BAND] {band_name} unavailable",
+            flush=True
+        )
+
+        return None
+
+    href = sign_asset(
+        asset["href"]
+    )
+
+    print(
+        f"[BAND] Reading AOI only: {band_name}",
+        flush=True
+    )
+
     try:
-        crit=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,120,1e-5)
-        cv2.findTransformECC(ag,bg,warp,cv2.MOTION_AFFINE,crit)
-        ag=cv2.warpAffine(ag,warp,(bg.shape[1],bg.shape[0]),flags=cv2.INTER_LINEAR+cv2.WARP_INVERSE_MAP)
+
+        with rasterio.Env(
+
+            GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+
+            CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif,.TIF",
+
+            GDAL_HTTP_TIMEOUT="60",
+
+            GDAL_HTTP_CONNECTTIMEOUT="20",
+
+            VSI_CACHE="TRUE",
+
+            VSI_CACHE_SIZE="5000000"
+
+        ):
+
+            with rasterio.open(href) as dataset:
+
+                # Convert AOI from WGS84 to the satellite
+                # raster coordinate reference system.
+
+                projected_bounds = transform_bounds(
+
+                    "EPSG:4326",
+
+                    dataset.crs,
+
+                    *aoi_bbox,
+
+                    densify_pts=21
+
+                )
+
+                window = from_bounds(
+
+                    *projected_bounds,
+
+                    transform=dataset.transform
+
+                )
+
+                # Restrict the window to the raster.
+
+                window = window.round_offsets().round_lengths()
+
+                raster_window = window.intersection(
+
+                    rasterio.windows.Window(
+
+                        0,
+                        0,
+                        dataset.width,
+                        dataset.height
+
+                    )
+
+                )
+
+                if (
+                    raster_window.width <= 0
+                    or raster_window.height <= 0
+                ):
+
+                    raise ValueError(
+                        f"AOI does not intersect "
+                        f"the {band_name} raster"
+                    )
+
+                # Read directly at analysis resolution.
+
+                data = dataset.read(
+
+                    1,
+
+                    window=raster_window,
+
+                    out_shape=(size, size),
+
+                    resampling=Resampling.bilinear
+
+                ).astype(np.float32)
+
+                return data
+
+    except Exception as e:
+
+        print(
+            f"[BAND ERROR] {band_name}: {e}",
+            flush=True
+        )
+
+        raise
+
+
+# ============================================================
+# IMAGE NORMALIZATION
+# ============================================================
+
+def stretch(array):
+
+    valid = array[array > 0]
+
+    if valid.size == 0:
+
+        return np.zeros_like(
+            array,
+            dtype=np.float32
+        )
+
+    low = np.percentile(
+        valid,
+        2
+    )
+
+    high = np.percentile(
+        valid,
+        98
+    )
+
+    normalized = (
+        array - low
+    ) / max(
+        high - low,
+        1e-6
+    )
+
+    return np.clip(
+        normalized,
+        0,
+        1
+    )
+
+
+# ============================================================
+# LOAD COMPLETE SCENE DATA
+# ============================================================
+
+def load_scene_data(
+    item_data,
+    aoi_bbox
+):
+    """
+    Load each required band only once.
+
+    This avoids downloading/reading B04 twice.
+    """
+
+    print(
+        "\n[SCENE] Loading analysis bands...",
+        flush=True
+    )
+
+    red = read_band_window(
+        item_data,
+        "B04",
+        aoi_bbox
+    )
+
+    green = read_band_window(
+        item_data,
+        "B03",
+        aoi_bbox
+    )
+
+    blue = read_band_window(
+        item_data,
+        "B02",
+        aoi_bbox
+    )
+
+    nir = read_band_window(
+        item_data,
+        "B08",
+        aoi_bbox
+    )
+
+    if any(
+        band is None
+        for band in [
+            red,
+            green,
+            blue
+        ]
+    ):
+
+        raise ValueError(
+            "Required RGB assets are unavailable"
+        )
+
+    rgb = (
+
+        np.stack(
+
+            [
+                stretch(red),
+                stretch(green),
+                stretch(blue)
+            ],
+
+            axis=-1
+
+        )
+
+        * 255
+
+    ).astype(np.uint8)
+
+    ndvi = None
+
+    if nir is not None:
+
+        ndvi = (
+
+            nir - red
+
+        ) / (
+
+            nir + red + 1e-6
+
+        )
+
+    return {
+
+        "rgb": rgb,
+
+        "ndvi": ndvi
+
+    }
+
+
+# ============================================================
+# IMAGE REGISTRATION + CHANGE DETECTION
+# ============================================================
+
+def align_and_change(
+    before_rgb,
+    after_rgb
+):
+
+    print(
+        "[PROCESS] Aligning imagery...",
+        flush=True
+    )
+
+    before_gray = cv2.cvtColor(
+
+        before_rgb,
+
+        cv2.COLOR_RGB2GRAY
+
+    )
+
+    after_gray = cv2.cvtColor(
+
+        after_rgb,
+
+        cv2.COLOR_RGB2GRAY
+
+    )
+
+    warp = np.eye(
+        2,
+        3,
+        dtype=np.float32
+    )
+
+    aligned_before = before_gray
+
+    try:
+
+        criteria = (
+
+            cv2.TERM_CRITERIA_EPS
+            |
+            cv2.TERM_CRITERIA_COUNT,
+
+            100,
+
+            1e-5
+
+        )
+
+        cv2.findTransformECC(
+
+            before_gray,
+
+            after_gray,
+
+            warp,
+
+            cv2.MOTION_AFFINE,
+
+            criteria
+
+        )
+
+        aligned_before = cv2.warpAffine(
+
+            before_gray,
+
+            warp,
+
+            (
+                after_gray.shape[1],
+                after_gray.shape[0]
+            ),
+
+            flags=(
+
+                cv2.INTER_LINEAR
+                +
+                cv2.WARP_INVERSE_MAP
+
+            )
+
+        )
+
+        print(
+            "[PROCESS] ECC alignment successful",
+            flush=True
+        )
+
     except cv2.error:
-        pass
-    diff=cv2.absdiff(ag,bg)
-    med=float(np.median(diff))
-    mad=float(np.median(np.abs(diff-med)))+1
-    th=max(18,med+3.0*mad)
-    mask=(diff>th).astype(np.uint8)*255
-    k=np.ones((7,7),np.uint8)
-    mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,k)
-    mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,k)
-    n, lab, stats, cents=cv2.connectedComponentsWithStats(mask)
-    features=[]
-    for i in range(1,n):
-        x,y,w,h,area=map(int,stats[i])
-        if area<180: continue
-        conf=min(.99,.55+area/25000)
-        features.append({"id":len(features)+1,"x":x,"y":y,"w":w,"h":h,"area_px":area,"confidence":round(conf,3)})
-    return mask,features,float(th)
 
-def semantic(query, change_features, ndvi_info):
-    q=query.lower()
-    concepts=[
-        ("New construction",["building","construction","structure","infrastructure"]),
-        ("Road expansion",["road","highway","transport"]),
-        ("Vegetation change",["vegetation","forest","crop","agriculture","green"]),
-        ("Water change",["water","lake","river","reservoir"]),
-        ("Bare/exposed land",["soil","bare","land","excavation"]),
-        ("Industrial infrastructure",["industrial","factory","facility"])
+        print(
+            "[PROCESS] ECC alignment skipped",
+            flush=True
+        )
+
+    print(
+        "[PROCESS] Detecting temporal change...",
+        flush=True
+    )
+
+    difference = cv2.absdiff(
+
+        aligned_before,
+
+        after_gray
+
+    )
+
+    median = float(
+        np.median(difference)
+    )
+
+    mad = float(
+
+        np.median(
+
+            np.abs(
+                difference - median
+            )
+
+        )
+
+    ) + 1
+
+    threshold = max(
+
+        18,
+
+        median + 3.0 * mad
+
+    )
+
+    mask = (
+
+        difference > threshold
+
+    ).astype(np.uint8) * 255
+
+    kernel = np.ones(
+        (7, 7),
+        np.uint8
+    )
+
+    mask = cv2.morphologyEx(
+
+        mask,
+
+        cv2.MORPH_OPEN,
+
+        kernel
+
+    )
+
+    mask = cv2.morphologyEx(
+
+        mask,
+
+        cv2.MORPH_CLOSE,
+
+        kernel
+
+    )
+
+    print(
+        "[PROCESS] Extracting change regions...",
+        flush=True
+    )
+
+    count, labels, stats, centroids = (
+
+        cv2.connectedComponentsWithStats(
+            mask
+        )
+
+    )
+
+    features = []
+
+    for i in range(1, count):
+
+        x, y, w, h, area = map(
+            int,
+            stats[i]
+        )
+
+        if area < 180:
+            continue
+
+        confidence = min(
+
+            0.99,
+
+            0.55 + area / 25000
+
+        )
+
+        features.append({
+
+            "id":
+                len(features) + 1,
+
+            "x":
+                x,
+
+            "y":
+                y,
+
+            "w":
+                w,
+
+            "h":
+                h,
+
+            "area_px":
+                area,
+
+            "confidence":
+                round(
+                    confidence,
+                    3
+                )
+
+        })
+
+    return (
+
+        mask,
+
+        features,
+
+        float(threshold)
+
+    )
+
+
+# ============================================================
+# SEMANTIC SCORING
+# ============================================================
+
+def semantic(
+    query,
+    change_features,
+    ndvi_info
+):
+
+    query = query.lower()
+
+    concepts = [
+
+        (
+            "New construction",
+
+            [
+                "building",
+                "construction",
+                "structure",
+                "infrastructure"
+            ]
+
+        ),
+
+        (
+            "Road expansion",
+
+            [
+                "road",
+                "highway",
+                "transport"
+            ]
+
+        ),
+
+        (
+            "Vegetation change",
+
+            [
+                "vegetation",
+                "forest",
+                "crop",
+                "agriculture",
+                "green"
+            ]
+
+        ),
+
+        (
+            "Water change",
+
+            [
+                "water",
+                "lake",
+                "river",
+                "reservoir"
+            ]
+
+        ),
+
+        (
+            "Bare/exposed land",
+
+            [
+                "soil",
+                "bare",
+                "land",
+                "excavation"
+            ]
+
+        ),
+
+        (
+            "Industrial infrastructure",
+
+            [
+                "industrial",
+                "factory",
+                "facility"
+            ]
+
+        )
+
     ]
-    # Transparent deterministic semantic prior from the user's query, combined with observed signals.
-    scores=[]
-    for label,words in concepts:
-        hits=sum(1 for w in words if w in q)
-        score=.22 + .12*hits
-        if ndvi_info and label=="Vegetation change":
-            score += min(.32, abs(ndvi_info["mean_delta"])*1.8)
-        if label in ("New construction","Road expansion","Industrial infrastructure"):
-            score += min(.28,len(change_features)/35)
-        scores.append({"label":label,"score":round(min(.96,score),3)})
-    return sorted(scores,key=lambda x:x["score"],reverse=True)
 
-def save_rgb(name, arr):
-    path=CACHE/name
+    scores = []
+
+    for label, words in concepts:
+
+        hits = sum(
+            1
+            for word in words
+            if word in query
+        )
+
+        score = 0.22 + (
+            0.12 * hits
+        )
+
+        if (
+            ndvi_info
+            and label == "Vegetation change"
+        ):
+
+            score += min(
+
+                0.32,
+
+                abs(
+                    ndvi_info["mean_delta"]
+                ) * 1.8
+
+            )
+
+        if label in (
+
+            "New construction",
+
+            "Road expansion",
+
+            "Industrial infrastructure"
+
+        ):
+
+            score += min(
+
+                0.28,
+
+                len(change_features) / 35
+
+            )
+
+        scores.append({
+
+            "label":
+                label,
+
+            "score":
+                round(
+                    min(0.96, score),
+                    3
+                )
+
+        })
+
+    return sorted(
+
+        scores,
+
+        key=lambda item:
+            item["score"],
+
+        reverse=True
+
+    )
+
+
+# ============================================================
+# SAVE IMAGES
+# ============================================================
+
+def save_image(
+    name,
+    image
+):
+
+    path = CACHE / name
+
     import PIL.Image
-    PIL.Image.fromarray(arr).save(path,quality=88)
+
+    PIL.Image.fromarray(
+        image
+    ).save(path)
+
     return path.name
+
+
+# ============================================================
+# ANALYSIS API
+# ============================================================
 
 @app.post("/api/analyze")
 def analyze(b: AnalyzeBody):
-    before=item(b.before_id); after=item(b.after_id)
-    A=rgb(before); B=rgb(after)
-    if A is None or B is None:
-        raise HTTPException(422,"RGB assets unavailable for selected scenes")
-    mask, feats, threshold=align_and_change(A,B)
 
-    bn,an=ndvi(before),ndvi(after)
-    ndvi_info=None
-    if bn is not None and an is not None:
-        delta=an-bn
-        ndvi_info={
-            "mean_delta":round(float(np.mean(delta)),4),
-            "loss_fraction":round(float(np.mean(delta < -.15)),4),
-            "gain_fraction":round(float(np.mean(delta > .15)),4)
+    print("\n" + "=" * 60, flush=True)
+
+    print(
+        "[ANALYSIS] GeoSentinel analysis started",
+        flush=True
+    )
+
+    print(
+        f"[ANALYSIS] BEFORE: {b.before_id}",
+        flush=True
+    )
+
+    print(
+        f"[ANALYSIS] AFTER:  {b.after_id}",
+        flush=True
+    )
+
+    try:
+
+        # ----------------------------------------------------
+        # STEP 1: AOI
+        # ----------------------------------------------------
+
+        aoi_bbox = make_bbox(
+
+            b.lat,
+
+            b.lon,
+
+            b.radius_km
+
+        )
+
+        print(
+            f"[ANALYSIS] AOI: {aoi_bbox}",
+            flush=True
+        )
+
+        # ----------------------------------------------------
+        # STEP 2: GET SCENE METADATA
+        # ----------------------------------------------------
+
+        before_item = get_item(
+            b.before_id
+        )
+
+        after_item = get_item(
+            b.after_id
+        )
+
+        # ----------------------------------------------------
+        # STEP 3: READ ONLY AOI
+        # ----------------------------------------------------
+
+        print(
+            "\n[ANALYSIS] Loading BEFORE AOI...",
+            flush=True
+        )
+
+        before_data = load_scene_data(
+
+            before_item,
+
+            aoi_bbox
+
+        )
+
+        print(
+            "\n[ANALYSIS] Loading AFTER AOI...",
+            flush=True
+        )
+
+        after_data = load_scene_data(
+
+            after_item,
+
+            aoi_bbox
+
+        )
+
+        before_rgb = before_data["rgb"]
+
+        after_rgb = after_data["rgb"]
+
+        # ----------------------------------------------------
+        # STEP 4: CHANGE DETECTION
+        # ----------------------------------------------------
+
+        mask, features, threshold = (
+
+            align_and_change(
+
+                before_rgb,
+
+                after_rgb
+
+            )
+
+        )
+
+        # ----------------------------------------------------
+        # STEP 5: NDVI
+        # ----------------------------------------------------
+
+        print(
+            "[PROCESS] Calculating NDVI statistics...",
+            flush=True
+        )
+
+        before_ndvi = before_data["ndvi"]
+
+        after_ndvi = after_data["ndvi"]
+
+        ndvi_info = None
+
+        if (
+            before_ndvi is not None
+            and after_ndvi is not None
+        ):
+
+            delta = (
+
+                after_ndvi
+                -
+                before_ndvi
+
+            )
+
+            ndvi_info = {
+
+                "mean_delta":
+
+                    round(
+                        float(
+                            np.mean(delta)
+                        ),
+                        4
+                    ),
+
+                "loss_fraction":
+
+                    round(
+                        float(
+                            np.mean(
+                                delta < -0.15
+                            )
+                        ),
+                        4
+                    ),
+
+                "gain_fraction":
+
+                    round(
+                        float(
+                            np.mean(
+                                delta > 0.15
+                            )
+                        ),
+                        4
+                    )
+
+            }
+
+        # ----------------------------------------------------
+        # STEP 6: SAVE OUTPUT
+        # ----------------------------------------------------
+
+        print(
+            "[PROCESS] Saving analysis outputs...",
+            flush=True
+        )
+
+        before_file = save_image(
+
+            f"{uuid.uuid4()}_before.jpg",
+
+            before_rgb
+
+        )
+
+        after_file = save_image(
+
+            f"{uuid.uuid4()}_after.jpg",
+
+            after_rgb
+
+        )
+
+        mask_file = save_image(
+
+            f"{uuid.uuid4()}_mask.png",
+
+            mask
+
+        )
+
+        # ----------------------------------------------------
+        # STEP 7: APPROXIMATE MAP COORDINATES
+        # ----------------------------------------------------
+
+        for feature in features:
+
+            feature["lat"] = (
+
+                b.lat
+
+                +
+
+                (
+
+                    (
+                        feature["y"]
+                        +
+                        feature["h"] / 2
+                    )
+
+                    / ANALYSIS_SIZE
+
+                    - 0.5
+
+                )
+
+                *
+
+                (
+                    b.radius_km / 111.32
+                )
+
+                * 2
+
+            )
+
+            feature["lon"] = (
+
+                b.lon
+
+                +
+
+                (
+
+                    (
+                        feature["x"]
+                        +
+                        feature["w"] / 2
+                    )
+
+                    / ANALYSIS_SIZE
+
+                    - 0.5
+
+                )
+
+                *
+
+                (
+
+                    b.radius_km
+
+                    /
+
+                    (
+
+                        111.32
+
+                        *
+
+                        max(
+
+                            0.1,
+
+                            math.cos(
+                                math.radians(
+                                    b.lat
+                                )
+                            )
+
+                        )
+
+                    )
+
+                )
+
+                * 2
+
+            )
+
+        # ----------------------------------------------------
+        # STEP 8: GEOJSON
+        # ----------------------------------------------------
+
+        geojson = {
+
+            "type":
+                "FeatureCollection",
+
+            "features":
+                []
+
         }
 
-    before_file=save_rgb(f"{uuid.uuid4()}_before.jpg",A)
-    after_file=save_rgb(f"{uuid.uuid4()}_after.jpg",B)
-    mask_file=save_rgb(f"{uuid.uuid4()}_mask.png",mask)
+        for feature in features:
 
-    # Approximate map coordinates for visualization inside AOI.
-    for f in feats:
-        f["lat"]=b.lat + ((f["y"]+f["h"]/2)/1024-.5)*(b.radius_km/111.32)*2
-        f["lon"]=b.lon + ((f["x"]+f["w"]/2)/1024-.5)*(b.radius_km/(111.32*max(.1,math.cos(math.radians(b.lat)))))*2
+            lat = feature["lat"]
 
-    geojson={"type":"FeatureCollection","features":[]}
-    for f in feats:
-        lat,lon=f["lat"],f["lon"]
-        dy=(f["h"]/1024)*(b.radius_km/111.32)*2
-        dx=(f["w"]/1024)*(b.radius_km/(111.32*max(.1,math.cos(math.radians(b.lat)))))*2
-        geojson["features"].append({
-            "type":"Feature","properties":f,
-            "geometry":{"type":"Polygon","coordinates":[[
-                [lon-dx/2,lat-dy/2],[lon+dx/2,lat-dy/2],
-                [lon+dx/2,lat+dy/2],[lon-dx/2,lat+dy/2],
-                [lon-dx/2,lat-dy/2]
-            ]]}
-        })
+            lon = feature["lon"]
 
-    return {
-        "before":{"id":b.before_id,"datetime":before["properties"].get("datetime"),"bbox":before.get("bbox"),"preview":f"/api/cache/{before_file}"},
-        "after":{"id":b.after_id,"datetime":after["properties"].get("datetime"),"bbox":after.get("bbox"),"preview":f"/api/cache/{after_file}"},
-        "mask":f"/api/cache/{mask_file}",
-        "changes":feats,
-        "geojson":geojson,
-        "threshold":round(threshold,2),
-        "ndvi":ndvi_info,
-        "semantic":semantic(b.query,feats,ndvi_info),
-        "method":"Sentinel-2 L2A RGB temporal comparison + ECC registration + robust thresholding + morphology + connected components + NDVI",
-        "query":b.query
-    }
+            dy = (
+
+                feature["h"]
+                /
+                ANALYSIS_SIZE
+
+            ) * (
+
+                b.radius_km / 111.32
+
+            ) * 2
+
+            dx = (
+
+                feature["w"]
+                /
+                ANALYSIS_SIZE
+
+            ) * (
+
+                b.radius_km
+
+                /
+
+                (
+
+                    111.32
+
+                    *
+
+                    max(
+
+                        0.1,
+
+                        math.cos(
+                            math.radians(
+                                b.lat
+                            )
+                        )
+
+                    )
+
+                )
+
+            ) * 2
+
+            geojson["features"].append({
+
+                "type":
+                    "Feature",
+
+                "properties":
+                    feature,
+
+                "geometry": {
+
+                    "type":
+                        "Polygon",
+
+                    "coordinates": [[
+
+                        [
+                            lon - dx / 2,
+                            lat - dy / 2
+                        ],
+
+                        [
+                            lon + dx / 2,
+                            lat - dy / 2
+                        ],
+
+                        [
+                            lon + dx / 2,
+                            lat + dy / 2
+                        ],
+
+                        [
+                            lon - dx / 2,
+                            lat + dy / 2
+                        ],
+
+                        [
+                            lon - dx / 2,
+                            lat - dy / 2
+                        ]
+
+                    ]]
+
+                }
+
+            })
+
+        # ----------------------------------------------------
+        # COMPLETE
+        # ----------------------------------------------------
+
+        print(
+            f"[ANALYSIS COMPLETE] "
+            f"{len(features)} candidate regions",
+            flush=True
+        )
+
+        print("=" * 60 + "\n", flush=True)
+
+        return {
+
+            "before": {
+
+                "id":
+                    b.before_id,
+
+                "datetime":
+                    before_item
+                    .get("properties", {})
+                    .get("datetime"),
+
+                "bbox":
+                    before_item.get("bbox"),
+
+                "preview":
+                    f"/api/cache/{before_file}"
+
+            },
+
+            "after": {
+
+                "id":
+                    b.after_id,
+
+                "datetime":
+                    after_item
+                    .get("properties", {})
+                    .get("datetime"),
+
+                "bbox":
+                    after_item.get("bbox"),
+
+                "preview":
+                    f"/api/cache/{after_file}"
+
+            },
+
+            "mask":
+                f"/api/cache/{mask_file}",
+
+            "changes":
+                features,
+
+            "geojson":
+                geojson,
+
+            "threshold":
+                round(
+                    threshold,
+                    2
+                ),
+
+            "ndvi":
+                ndvi_info,
+
+            "semantic":
+                semantic(
+
+                    b.query,
+
+                    features,
+
+                    ndvi_info
+
+                ),
+
+            "method":
+                "Sentinel-2 L2A AOI windowed RGB "
+                "temporal comparison + ECC registration + "
+                "robust thresholding + morphology + "
+                "connected components + NDVI",
+
+            "query":
+                b.query
+
+        }
+
+    except HTTPException:
+
+        raise
+
+    except Exception as e:
+
+        print(
+            f"\n[ANALYSIS ERROR] {type(e).__name__}: {e}\n",
+            flush=True
+        )
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=(
+                "Satellite analysis failed: "
+                f"{type(e).__name__}: {e}"
+            )
+
+        )
+
+
+# ============================================================
+# CACHE FILES
+# ============================================================
 
 @app.get("/api/cache/{name}")
-def cache_file(name:str):
-    p=CACHE/Path(name).name
-    if not p.exists(): raise HTTPException(404,"Not found")
-    return FileResponse(p)
+def cache_file(name: str):
+
+    path = CACHE / Path(name).name
+
+    if not path.exists():
+
+        raise HTTPException(
+            404,
+            "Not found"
+        )
+
+    return FileResponse(path)
+
+
+# ============================================================
+# REPORT
+# ============================================================
 
 @app.get("/api/export/{kind}")
-def export(kind:str):
-    # The frontend passes its current GeoJSON as a data URL only for browser download;
-    # this endpoint provides a minimal human-readable report.
-    if kind=="report":
-        html="""<!doctype html><html><head><meta charset=utf-8><title>GeoSentinel AI Report</title>
-        <style>body{font:15px Arial;max-width:900px;margin:40px auto;color:#17324d}h1{font-size:30px}.box{padding:16px;background:#f2f6f8;border-left:4px solid #355c7d}</style></head>
-        <body><h1>GeoSentinel AI — Change Detection Report</h1>
-        <p><b>Source:</b> Sentinel-2 L2A via Microsoft Planetary Computer STAC.</p>
-        <div class=box><b>Review requirement:</b> Results are candidate change signals. An authorized human analyst should validate them before operational use.</div>
-        <h2>Pipeline</h2><p>Scene search → image retrieval → alignment → temporal difference → morphology → connected components → NDVI → semantic ranking → GIS visualization.</p>
-        </body></html>"""
+def export(kind: str):
+
+    if kind == "report":
+
+        html = """
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
+<title>GeoSentinel AI Report</title>
+
+<style>
+
+body{
+    font:15px Arial;
+    max-width:900px;
+    margin:40px auto;
+    color:#17324d
+}
+
+h1{
+    font-size:30px
+}
+
+.box{
+    padding:16px;
+    background:#f2f6f8;
+    border-left:4px solid #355c7d
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>
+GeoSentinel AI — Change Detection Report
+</h1>
+
+<p>
+<b>Source:</b>
+Sentinel-2 L2A via Microsoft Planetary Computer STAC.
+</p>
+
+<div class="box">
+
+<b>Review requirement:</b>
+
+Results are candidate change signals.
+
+An authorized human analyst should validate them before
+operational use.
+
+</div>
+
+<h2>Pipeline</h2>
+
+<p>
+
+Scene search
+→ AOI raster retrieval
+→ alignment
+→ temporal difference
+→ morphology
+→ connected components
+→ NDVI
+→ semantic ranking
+→ GIS visualization.
+
+</p>
+
+</body>
+
+</html>
+"""
+
         return HTMLResponse(html)
-    raise HTTPException(404,"Unknown export")
+
+    raise HTTPException(
+        404,
+        "Unknown export"
+    )
+
+
+# ============================================================
+# TIMELINE
+# ============================================================
 
 @app.get("/api/timeline")
 def timeline():
-    return {"description":"Use the selected before/after scenes returned by /api/search as temporal points."}
+
+    return {
+
+        "description":
+            "Use selected before/after scenes returned "
+            "by /api/search as temporal points."
+
+    }
