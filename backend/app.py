@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import time
 import uuid
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import cv2
@@ -19,7 +22,7 @@ from rasterio.warp import transform_bounds
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 STAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
@@ -28,13 +31,21 @@ SAS = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
 CACHE = Path(__file__).parent / "cache"
 CACHE.mkdir(exist_ok=True)
 
+ANALYSIS_CACHE = CACHE / "analysis_cache"
+ANALYSIS_CACHE.mkdir(exist_ok=True)
+
 ANALYSIS_SIZE = 512
 
 SESSION = requests.Session()
 
+
+# ============================================================
+# APP
+# ============================================================
+
 app = FastAPI(
     title="GeoSentinel AI",
-    version="2.1"
+    version="2.2"
 )
 
 app.add_middleware(
@@ -50,46 +61,40 @@ app.add_middleware(
 
 
 # ============================================================
-# REQUEST MODELS
+# MODELS
 # ============================================================
 
 class SearchBody(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lon: float = Field(..., ge=-180, le=180)
     radius_km: float = Field(5, gt=0, le=50)
-
     start: date
     end: date
-
     cloud: float = Field(20, ge=0, le=100)
 
 
 class AnalyzeBody(BaseModel):
     before_id: str
     after_id: str
-
     query: str
-
     lat: float
     lon: float
-
     radius_km: float
 
 
 # ============================================================
-# GEOGRAPHIC HELPERS
+# GEO HELPERS
 # ============================================================
 
 def make_bbox(lat: float, lon: float, km: float):
-    """
-    Create an approximate WGS84 bounding box around the AOI.
-    """
-
     dlat = km / 111.32
 
     dlon = km / (
         111.32 *
-        max(0.1, math.cos(math.radians(lat)))
+        max(
+            0.1,
+            math.cos(math.radians(lat))
+        )
     )
 
     return [
@@ -100,8 +105,90 @@ def make_bbox(lat: float, lon: float, km: float):
     ]
 
 
+def seasonal_similarity(
+    before_datetime,
+    after_datetime
+):
+    """
+    Compare acquisition dates using month/day proximity.
+
+    This is only a warning signal. It does not determine
+    whether two scenes are scientifically comparable.
+    """
+
+    if not before_datetime or not after_datetime:
+        return {
+            "score": None,
+            "warning": False,
+            "message": None
+        }
+
+    try:
+        before = datetime.fromisoformat(
+            before_datetime.replace("Z", "+00:00")
+        )
+
+        after = datetime.fromisoformat(
+            after_datetime.replace("Z", "+00:00")
+        )
+
+        before_day = before.timetuple().tm_yday
+        after_day = after.timetuple().tm_yday
+
+        diff = abs(
+            before_day - after_day
+        )
+
+        # Handle wrap-around at year boundary.
+        diff = min(
+            diff,
+            365 - diff
+        )
+
+        score = max(
+            0.0,
+            1.0 - diff / 182.5
+        )
+
+        if diff <= 30:
+            message = (
+                "Good seasonal match. "
+                "Acquisition windows are broadly comparable."
+            )
+            warning = False
+
+        elif diff <= 75:
+            message = (
+                "Moderate seasonal difference. "
+                "Vegetation and illumination may affect change signals."
+            )
+            warning = True
+
+        else:
+            message = (
+                "Low seasonal similarity. "
+                "Vegetation, illumination and atmospheric differences "
+                "may increase false positives."
+            )
+            warning = True
+
+        return {
+            "score": round(score, 3),
+            "day_difference": diff,
+            "warning": warning,
+            "message": message
+        }
+
+    except Exception:
+        return {
+            "score": None,
+            "warning": False,
+            "message": None
+        }
+
+
 # ============================================================
-# HTTP HELPERS
+# HTTP
 # ============================================================
 
 def get_json(url, **kwargs):
@@ -139,19 +226,28 @@ def health():
 
     return {
         "ok": True,
-        "data_source": "Microsoft Planetary Computer / Sentinel-2 L2A",
-        "analysis_mode": "AOI windowed raster processing"
+        "data_source":
+            "Microsoft Planetary Computer / Sentinel-2 L2A",
+        "analysis_mode":
+            "AOI windowed raster processing",
+        "analysis_size":
+            ANALYSIS_SIZE,
+        "caching":
+            True
     }
 
 
 # ============================================================
-# STAC SEARCH
+# SEARCH
 # ============================================================
 
 @app.post("/api/search")
 def search(b: SearchBody):
 
-    print("\n[SEARCH] Searching Sentinel-2 scenes...", flush=True)
+    print(
+        "\n[SEARCH] Searching Sentinel-2 scenes...",
+        flush=True
+    )
 
     aoi_bbox = make_bbox(
         b.lat,
@@ -160,17 +256,20 @@ def search(b: SearchBody):
     )
 
     payload = {
+
         "collections": [
             "sentinel-2-l2a"
         ],
 
-        "bbox": aoi_bbox,
+        "bbox":
+            aoi_bbox,
 
         "datetime":
             f"{b.start}T00:00:00Z/"
             f"{b.end}T23:59:59Z",
 
-        "limit": 24,
+        "limit":
+            24,
 
         "query": {
             "eo:cloud_cover": {
@@ -195,7 +294,10 @@ def search(b: SearchBody):
 
     except Exception as e:
 
-        print(f"[SEARCH ERROR] {e}", flush=True)
+        print(
+            f"[SEARCH ERROR] {e}",
+            flush=True
+        )
 
         raise HTTPException(
             502,
@@ -204,7 +306,10 @@ def search(b: SearchBody):
 
     output = []
 
-    for scene in data.get("features", []):
+    for scene in data.get(
+        "features",
+        []
+    ):
 
         properties = scene.get(
             "properties",
@@ -217,9 +322,19 @@ def search(b: SearchBody):
         )
 
         preview = (
-            assets.get("rendered_preview")
-            or assets.get("thumbnail")
+
+            assets.get(
+                "rendered_preview"
+            )
+
+            or
+
+            assets.get(
+                "thumbnail"
+            )
+
             or {}
+
         ).get("href")
 
         output.append({
@@ -228,7 +343,9 @@ def search(b: SearchBody):
                 scene["id"],
 
             "datetime":
-                properties.get("datetime"),
+                properties.get(
+                    "datetime"
+                ),
 
             "cloud":
                 properties.get(
@@ -245,7 +362,9 @@ def search(b: SearchBody):
                 preview,
 
             "assets":
-                list(assets.keys())
+                list(
+                    assets.keys()
+                )
 
         })
 
@@ -255,18 +374,17 @@ def search(b: SearchBody):
     )
 
     return {
-
-        "scenes": output,
-
-        "bbox": aoi_bbox,
-
-        "query": payload
-
+        "scenes":
+            output,
+        "bbox":
+            aoi_bbox,
+        "query":
+            payload
     }
 
 
 # ============================================================
-# GET COMPLETE STAC ITEM
+# STAC ITEM
 # ============================================================
 
 def get_item(item_id: str):
@@ -283,7 +401,7 @@ def get_item(item_id: str):
 
 
 # ============================================================
-# SIGN PLANETARY COMPUTER ASSET
+# ASSET SIGNING
 # ============================================================
 
 def sign_asset(href: str):
@@ -299,7 +417,8 @@ def sign_asset(href: str):
     data = get_json(
         SAS,
         params={
-            "href": href
+            "href":
+                href
         }
     )
 
@@ -307,7 +426,7 @@ def sign_asset(href: str):
 
 
 # ============================================================
-# READ ONLY AOI FROM REMOTE COG
+# REMOTE AOI WINDOW
 # ============================================================
 
 def read_band_window(
@@ -316,14 +435,6 @@ def read_band_window(
     aoi_bbox,
     size=ANALYSIS_SIZE
 ):
-    """
-    IMPORTANT:
-
-    This does NOT download the entire Sentinel-2 GeoTIFF.
-
-    Rasterio/GDAL performs HTTP range reads and requests
-    only the geographic AOI required for analysis.
-    """
 
     asset = (
         item_data
@@ -355,7 +466,8 @@ def read_band_window(
 
             GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
 
-            CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif,.TIF",
+            CPL_VSIL_CURL_ALLOWED_EXTENSIONS=
+                ".tif,.TIF",
 
             GDAL_HTTP_TIMEOUT="60",
 
@@ -367,10 +479,9 @@ def read_band_window(
 
         ):
 
-            with rasterio.open(href) as dataset:
-
-                # Convert AOI from WGS84 to the satellite
-                # raster coordinate reference system.
+            with rasterio.open(
+                href
+            ) as dataset:
 
                 projected_bounds = transform_bounds(
 
@@ -381,45 +492,48 @@ def read_band_window(
                     *aoi_bbox,
 
                     densify_pts=21
-
                 )
 
                 window = from_bounds(
 
                     *projected_bounds,
 
-                    transform=dataset.transform
+                    transform=
+                        dataset.transform
 
                 )
 
-                # Restrict the window to the raster.
+                window = (
+                    window
+                    .round_offsets()
+                    .round_lengths()
+                )
 
-                window = window.round_offsets().round_lengths()
-
-                raster_window = window.intersection(
-
+                full_window = (
                     rasterio.windows.Window(
-
                         0,
                         0,
                         dataset.width,
                         dataset.height
-
                     )
+                )
 
+                raster_window = (
+                    window.intersection(
+                        full_window
+                    )
                 )
 
                 if (
                     raster_window.width <= 0
-                    or raster_window.height <= 0
+                    or
+                    raster_window.height <= 0
                 ):
 
                     raise ValueError(
                         f"AOI does not intersect "
-                        f"the {band_name} raster"
+                        f"{band_name}"
                     )
-
-                # Read directly at analysis resolution.
 
                 data = dataset.read(
 
@@ -427,11 +541,17 @@ def read_band_window(
 
                     window=raster_window,
 
-                    out_shape=(size, size),
+                    out_shape=(
+                        size,
+                        size
+                    ),
 
-                    resampling=Resampling.bilinear
+                    resampling=
+                        Resampling.bilinear
 
-                ).astype(np.float32)
+                ).astype(
+                    np.float32
+                )
 
                 return data
 
@@ -446,12 +566,14 @@ def read_band_window(
 
 
 # ============================================================
-# IMAGE NORMALIZATION
+# NORMALIZATION
 # ============================================================
 
 def stretch(array):
 
-    valid = array[array > 0]
+    valid = array[
+        array > 0
+    ]
 
     if valid.size == 0:
 
@@ -471,10 +593,15 @@ def stretch(array):
     )
 
     normalized = (
+
         array - low
+
     ) / max(
+
         high - low,
+
         1e-6
+
     )
 
     return np.clip(
@@ -485,18 +612,13 @@ def stretch(array):
 
 
 # ============================================================
-# LOAD COMPLETE SCENE DATA
+# LOAD SCENE
 # ============================================================
 
 def load_scene_data(
     item_data,
     aoi_bbox
 ):
-    """
-    Load each required band only once.
-
-    This avoids downloading/reading B04 twice.
-    """
 
     print(
         "\n[SCENE] Loading analysis bands...",
@@ -528,8 +650,8 @@ def load_scene_data(
     )
 
     if any(
-        band is None
-        for band in [
+        value is None
+        for value in [
             red,
             green,
             blue
@@ -537,7 +659,7 @@ def load_scene_data(
     ):
 
         raise ValueError(
-            "Required RGB assets are unavailable"
+            "Required RGB assets unavailable"
         )
 
     rgb = (
@@ -556,7 +678,9 @@ def load_scene_data(
 
         * 255
 
-    ).astype(np.uint8)
+    ).astype(
+        np.uint8
+    )
 
     ndvi = None
 
@@ -574,15 +698,16 @@ def load_scene_data(
 
     return {
 
-        "rgb": rgb,
+        "rgb":
+            rgb,
 
-        "ndvi": ndvi
-
+        "ndvi":
+            ndvi
     }
 
 
 # ============================================================
-# IMAGE REGISTRATION + CHANGE DETECTION
+# CHANGE DETECTION
 # ============================================================
 
 def align_and_change(
@@ -596,19 +721,13 @@ def align_and_change(
     )
 
     before_gray = cv2.cvtColor(
-
         before_rgb,
-
         cv2.COLOR_RGB2GRAY
-
     )
 
     after_gray = cv2.cvtColor(
-
         after_rgb,
-
         cv2.COLOR_RGB2GRAY
-
     )
 
     warp = np.eye(
@@ -659,11 +778,9 @@ def align_and_change(
             ),
 
             flags=(
-
                 cv2.INTER_LINEAR
-                +
+                |
                 cv2.WARP_INVERSE_MAP
-
             )
 
         )
@@ -686,15 +803,14 @@ def align_and_change(
     )
 
     difference = cv2.absdiff(
-
         aligned_before,
-
         after_gray
-
     )
 
     median = float(
-        np.median(difference)
+        np.median(
+            difference
+        )
     )
 
     mad = float(
@@ -710,18 +826,17 @@ def align_and_change(
     ) + 1
 
     threshold = max(
-
         18,
-
         median + 3.0 * mad
-
     )
 
     mask = (
 
         difference > threshold
 
-    ).astype(np.uint8) * 255
+    ).astype(
+        np.uint8
+    ) * 255
 
     kernel = np.ones(
         (7, 7),
@@ -729,23 +844,15 @@ def align_and_change(
     )
 
     mask = cv2.morphologyEx(
-
         mask,
-
         cv2.MORPH_OPEN,
-
         kernel
-
     )
 
     mask = cv2.morphologyEx(
-
         mask,
-
         cv2.MORPH_CLOSE,
-
         kernel
-
     )
 
     print(
@@ -763,7 +870,10 @@ def align_and_change(
 
     features = []
 
-    for i in range(1, count):
+    for i in range(
+        1,
+        count
+    ):
 
         x, y, w, h, area = map(
             int,
@@ -774,11 +884,8 @@ def align_and_change(
             continue
 
         confidence = min(
-
             0.99,
-
             0.55 + area / 25000
-
         )
 
         features.append({
@@ -810,18 +917,14 @@ def align_and_change(
         })
 
     return (
-
         mask,
-
         features,
-
         float(threshold)
-
     )
 
 
 # ============================================================
-# SEMANTIC SCORING
+# SEMANTIC RANKING
 # ============================================================
 
 def semantic(
@@ -843,7 +946,6 @@ def semantic(
                 "structure",
                 "infrastructure"
             ]
-
         ),
 
         (
@@ -854,7 +956,6 @@ def semantic(
                 "highway",
                 "transport"
             ]
-
         ),
 
         (
@@ -867,7 +968,6 @@ def semantic(
                 "agriculture",
                 "green"
             ]
-
         ),
 
         (
@@ -879,7 +979,6 @@ def semantic(
                 "river",
                 "reservoir"
             ]
-
         ),
 
         (
@@ -891,7 +990,6 @@ def semantic(
                 "land",
                 "excavation"
             ]
-
         ),
 
         (
@@ -902,7 +1000,6 @@ def semantic(
                 "factory",
                 "facility"
             ]
-
         )
 
     ]
@@ -912,18 +1009,24 @@ def semantic(
     for label, words in concepts:
 
         hits = sum(
+
             1
             for word in words
             if word in query
+
         )
 
-        score = 0.22 + (
+        score = (
+            0.22
+            +
             0.12 * hits
         )
 
         if (
             ndvi_info
-            and label == "Vegetation change"
+            and
+            label ==
+                "Vegetation change"
         ):
 
             score += min(
@@ -931,17 +1034,16 @@ def semantic(
                 0.32,
 
                 abs(
-                    ndvi_info["mean_delta"]
+                    ndvi_info[
+                        "mean_delta"
+                    ]
                 ) * 1.8
-
             )
 
         if label in (
 
             "New construction",
-
             "Road expansion",
-
             "Industrial infrastructure"
 
         ):
@@ -950,7 +1052,9 @@ def semantic(
 
                 0.28,
 
-                len(change_features) / 35
+                len(
+                    change_features
+                ) / 35
 
             )
 
@@ -961,7 +1065,10 @@ def semantic(
 
             "score":
                 round(
-                    min(0.96, score),
+                    min(
+                        0.96,
+                        score
+                    ),
                     3
                 )
 
@@ -971,8 +1078,8 @@ def semantic(
 
         scores,
 
-        key=lambda item:
-            item["score"],
+        key=lambda x:
+            x["score"],
 
         reverse=True
 
@@ -980,7 +1087,7 @@ def semantic(
 
 
 # ============================================================
-# SAVE IMAGES
+# FILE SAVING
 # ============================================================
 
 def save_image(
@@ -990,9 +1097,9 @@ def save_image(
 
     path = CACHE / name
 
-    import PIL.Image
+    from PIL import Image
 
-    PIL.Image.fromarray(
+    Image.fromarray(
         image
     ).save(path)
 
@@ -1000,13 +1107,165 @@ def save_image(
 
 
 # ============================================================
-# ANALYSIS API
+# ANALYSIS CACHE
+# ============================================================
+
+def analysis_cache_key(
+    before_id,
+    after_id,
+    query,
+    lat,
+    lon,
+    radius_km
+):
+
+    payload = {
+
+        "before":
+            before_id,
+
+        "after":
+            after_id,
+
+        "query":
+            query.strip().lower(),
+
+        "lat":
+            round(lat, 6),
+
+        "lon":
+            round(lon, 6),
+
+        "radius_km":
+            round(radius_km, 3),
+
+        "size":
+            ANALYSIS_SIZE,
+
+        "version":
+            "2.2"
+
+    }
+
+    raw = json.dumps(
+        payload,
+        sort_keys=True
+    )
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
+
+
+def cache_path(key):
+
+    return (
+        ANALYSIS_CACHE
+        /
+        f"{key}.json"
+    )
+
+
+def load_cached_analysis(key):
+
+    path = cache_path(key)
+
+    if not path.exists():
+        return None
+
+    try:
+
+        with path.open(
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(file)
+
+        # Make sure generated images still exist.
+        required = [
+
+            data
+            .get("before", {})
+            .get("preview", ""),
+
+            data
+            .get("after", {})
+            .get("preview", ""),
+
+            data.get("mask", "")
+
+        ]
+
+        for url in required:
+
+            filename = (
+                Path(url).name
+            )
+
+            if not (
+                CACHE / filename
+            ).exists():
+
+                print(
+                    "[CACHE] Image missing; "
+                    "recomputing.",
+                    flush=True
+                )
+
+                return None
+
+        return data
+
+    except Exception as e:
+
+        print(
+            f"[CACHE] Invalid cache: {e}",
+            flush=True
+        )
+
+        return None
+
+
+def save_cached_analysis(
+    key,
+    result
+):
+
+    path = cache_path(key)
+
+    temp_path = path.with_suffix(
+        ".tmp"
+    )
+
+    with temp_path.open(
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            result,
+            file
+        )
+
+    temp_path.replace(path)
+
+
+# ============================================================
+# ANALYZE
 # ============================================================
 
 @app.post("/api/analyze")
-def analyze(b: AnalyzeBody):
+def analyze(
+    b: AnalyzeBody
+):
 
-    print("\n" + "=" * 60, flush=True)
+    start_time = time.perf_counter()
+
+    print(
+        "\n" + "=" * 60,
+        flush=True
+    )
 
     print(
         "[ANALYSIS] GeoSentinel analysis started",
@@ -1023,20 +1282,66 @@ def analyze(b: AnalyzeBody):
         flush=True
     )
 
+    # --------------------------------------------------------
+    # CACHE CHECK
+    # --------------------------------------------------------
+
+    key = analysis_cache_key(
+
+        b.before_id,
+        b.after_id,
+        b.query,
+        b.lat,
+        b.lon,
+        b.radius_km
+
+    )
+
+    cached = load_cached_analysis(
+        key
+    )
+
+    if cached is not None:
+
+        cached["cache"] = {
+            "hit": True,
+            "key": key
+        }
+
+        elapsed = (
+            time.perf_counter()
+            -
+            start_time
+        )
+
+        print(
+            f"[CACHE HIT] Returning cached "
+            f"analysis in {elapsed:.2f}s",
+            flush=True
+        )
+
+        print(
+            "=" * 60 + "\n",
+            flush=True
+        )
+
+        return cached
+
+    print(
+        "[CACHE MISS] Running new analysis",
+        flush=True
+    )
+
     try:
 
         # ----------------------------------------------------
-        # STEP 1: AOI
+        # AOI
         # ----------------------------------------------------
 
         aoi_bbox = make_bbox(
-
             b.lat,
-
             b.lon,
-
             b.radius_km
-
         )
 
         print(
@@ -1045,7 +1350,7 @@ def analyze(b: AnalyzeBody):
         )
 
         # ----------------------------------------------------
-        # STEP 2: GET SCENE METADATA
+        # METADATA
         # ----------------------------------------------------
 
         before_item = get_item(
@@ -1056,8 +1361,33 @@ def analyze(b: AnalyzeBody):
             b.after_id
         )
 
+        before_datetime = (
+            before_item
+            .get("properties", {})
+            .get("datetime")
+        )
+
+        after_datetime = (
+            after_item
+            .get("properties", {})
+            .get("datetime")
+        )
+
+        seasonal = seasonal_similarity(
+            before_datetime,
+            after_datetime
+        )
+
+        if seasonal["warning"]:
+
+            print(
+                "[WARNING] " +
+                seasonal["message"],
+                flush=True
+            )
+
         # ----------------------------------------------------
-        # STEP 3: READ ONLY AOI
+        # BEFORE
         # ----------------------------------------------------
 
         print(
@@ -1073,6 +1403,10 @@ def analyze(b: AnalyzeBody):
 
         )
 
+        # ----------------------------------------------------
+        # AFTER
+        # ----------------------------------------------------
+
         print(
             "\n[ANALYSIS] Loading AFTER AOI...",
             flush=True
@@ -1086,12 +1420,16 @@ def analyze(b: AnalyzeBody):
 
         )
 
-        before_rgb = before_data["rgb"]
+        before_rgb = (
+            before_data["rgb"]
+        )
 
-        after_rgb = after_data["rgb"]
+        after_rgb = (
+            after_data["rgb"]
+        )
 
         # ----------------------------------------------------
-        # STEP 4: CHANGE DETECTION
+        # CHANGE
         # ----------------------------------------------------
 
         mask, features, threshold = (
@@ -1099,7 +1437,6 @@ def analyze(b: AnalyzeBody):
             align_and_change(
 
                 before_rgb,
-
                 after_rgb
 
             )
@@ -1107,37 +1444,39 @@ def analyze(b: AnalyzeBody):
         )
 
         # ----------------------------------------------------
-        # STEP 5: NDVI
+        # NDVI
         # ----------------------------------------------------
 
         print(
-            "[PROCESS] Calculating NDVI statistics...",
+            "[PROCESS] Calculating NDVI...",
             flush=True
         )
 
-        before_ndvi = before_data["ndvi"]
+        before_ndvi = (
+            before_data["ndvi"]
+        )
 
-        after_ndvi = after_data["ndvi"]
+        after_ndvi = (
+            after_data["ndvi"]
+        )
 
         ndvi_info = None
 
         if (
             before_ndvi is not None
-            and after_ndvi is not None
+            and
+            after_ndvi is not None
         ):
 
             delta = (
-
                 after_ndvi
                 -
                 before_ndvi
-
             )
 
             ndvi_info = {
 
                 "mean_delta":
-
                     round(
                         float(
                             np.mean(delta)
@@ -1146,7 +1485,6 @@ def analyze(b: AnalyzeBody):
                     ),
 
                 "loss_fraction":
-
                     round(
                         float(
                             np.mean(
@@ -1157,7 +1495,6 @@ def analyze(b: AnalyzeBody):
                     ),
 
                 "gain_fraction":
-
                     round(
                         float(
                             np.mean(
@@ -1170,11 +1507,11 @@ def analyze(b: AnalyzeBody):
             }
 
         # ----------------------------------------------------
-        # STEP 6: SAVE OUTPUT
+        # SAVE
         # ----------------------------------------------------
 
         print(
-            "[PROCESS] Saving analysis outputs...",
+            "[PROCESS] Saving outputs...",
             flush=True
         )
 
@@ -1203,7 +1540,7 @@ def analyze(b: AnalyzeBody):
         )
 
         # ----------------------------------------------------
-        # STEP 7: APPROXIMATE MAP COORDINATES
+        # MAP COORDINATES
         # ----------------------------------------------------
 
         for feature in features:
@@ -1221,20 +1558,23 @@ def analyze(b: AnalyzeBody):
                         +
                         feature["h"] / 2
                     )
-
-                    / ANALYSIS_SIZE
-
-                    - 0.5
+                    /
+                    ANALYSIS_SIZE
+                    -
+                    0.5
 
                 )
 
                 *
 
                 (
-                    b.radius_km / 111.32
+                    b.radius_km
+                    /
+                    111.32
                 )
 
-                * 2
+                *
+                2
 
             )
 
@@ -1251,10 +1591,10 @@ def analyze(b: AnalyzeBody):
                         +
                         feature["w"] / 2
                     )
-
-                    / ANALYSIS_SIZE
-
-                    - 0.5
+                    /
+                    ANALYSIS_SIZE
+                    -
+                    0.5
 
                 )
 
@@ -1263,37 +1603,29 @@ def analyze(b: AnalyzeBody):
                 (
 
                     b.radius_km
-
                     /
-
                     (
-
                         111.32
-
                         *
-
                         max(
-
                             0.1,
-
                             math.cos(
                                 math.radians(
                                     b.lat
                                 )
                             )
-
                         )
-
                     )
 
                 )
 
-                * 2
+                *
+                2
 
             )
 
         # ----------------------------------------------------
-        # STEP 8: GEOJSON
+        # GEOJSON
         # ----------------------------------------------------
 
         geojson = {
@@ -1320,7 +1652,9 @@ def analyze(b: AnalyzeBody):
 
             ) * (
 
-                b.radius_km / 111.32
+                b.radius_km
+                /
+                111.32
 
             ) * 2
 
@@ -1333,32 +1667,25 @@ def analyze(b: AnalyzeBody):
             ) * (
 
                 b.radius_km
-
                 /
-
                 (
-
                     111.32
-
                     *
-
                     max(
-
                         0.1,
-
                         math.cos(
                             math.radians(
                                 b.lat
                             )
                         )
-
                     )
-
                 )
 
             ) * 2
 
-            geojson["features"].append({
+            geojson[
+                "features"
+            ].append({
 
                 "type":
                     "Feature",
@@ -1405,18 +1732,10 @@ def analyze(b: AnalyzeBody):
             })
 
         # ----------------------------------------------------
-        # COMPLETE
+        # RESULT
         # ----------------------------------------------------
 
-        print(
-            f"[ANALYSIS COMPLETE] "
-            f"{len(features)} candidate regions",
-            flush=True
-        )
-
-        print("=" * 60 + "\n", flush=True)
-
-        return {
+        result = {
 
             "before": {
 
@@ -1424,12 +1743,12 @@ def analyze(b: AnalyzeBody):
                     b.before_id,
 
                 "datetime":
-                    before_item
-                    .get("properties", {})
-                    .get("datetime"),
+                    before_datetime,
 
                 "bbox":
-                    before_item.get("bbox"),
+                    before_item.get(
+                        "bbox"
+                    ),
 
                 "preview":
                     f"/api/cache/{before_file}"
@@ -1442,12 +1761,12 @@ def analyze(b: AnalyzeBody):
                     b.after_id,
 
                 "datetime":
-                    after_item
-                    .get("properties", {})
-                    .get("datetime"),
+                    after_datetime,
 
                 "bbox":
-                    after_item.get("bbox"),
+                    after_item.get(
+                        "bbox"
+                    ),
 
                 "preview":
                     f"/api/cache/{after_file}"
@@ -1474,14 +1793,13 @@ def analyze(b: AnalyzeBody):
 
             "semantic":
                 semantic(
-
                     b.query,
-
                     features,
-
                     ndvi_info
-
                 ),
+
+            "seasonal_similarity":
+                seasonal,
 
             "method":
                 "Sentinel-2 L2A AOI windowed RGB "
@@ -1490,9 +1808,53 @@ def analyze(b: AnalyzeBody):
                 "connected components + NDVI",
 
             "query":
-                b.query
+                b.query,
+
+            "cache": {
+
+                "hit":
+                    False,
+
+                "key":
+                    key
+
+            }
 
         }
+
+        # ----------------------------------------------------
+        # SAVE CACHE
+        # ----------------------------------------------------
+
+        save_cached_analysis(
+            key,
+            result
+        )
+
+        elapsed = (
+            time.perf_counter()
+            -
+            start_time
+        )
+
+        print(
+            f"[ANALYSIS COMPLETE] "
+            f"{len(features)} candidate regions "
+            f"in {elapsed:.2f}s",
+            flush=True
+        )
+
+        print(
+            "[CACHE] Analysis saved.",
+            flush=True
+        )
+
+        print(
+            "=" * 60 + "\n",
+            flush=True
+        )
+
+        return result
 
     except HTTPException:
 
@@ -1501,7 +1863,13 @@ def analyze(b: AnalyzeBody):
     except Exception as e:
 
         print(
-            f"\n[ANALYSIS ERROR] {type(e).__name__}: {e}\n",
+            "\n[ANALYSIS ERROR] "
+            f"{type(e).__name__}: {e}",
+            flush=True
+        )
+
+        print(
+            "=" * 60 + "\n",
             flush=True
         )
 
@@ -1524,7 +1892,11 @@ def analyze(b: AnalyzeBody):
 @app.get("/api/cache/{name}")
 def cache_file(name: str):
 
-    path = CACHE / Path(name).name
+    path = (
+        CACHE
+        /
+        Path(name).name
+    )
 
     if not path.exists():
 
@@ -1533,7 +1905,9 @@ def cache_file(name: str):
             "Not found"
         )
 
-    return FileResponse(path)
+    return FileResponse(
+        path
+    )
 
 
 # ============================================================
@@ -1575,6 +1949,12 @@ h1{
     border-left:4px solid #355c7d
 }
 
+.warn{
+    padding:16px;
+    background:#fff7e6;
+    border-left:4px solid #b7791f
+}
+
 </style>
 
 </head>
@@ -1596,8 +1976,18 @@ Sentinel-2 L2A via Microsoft Planetary Computer STAC.
 
 Results are candidate change signals.
 
-An authorized human analyst should validate them before
-operational use.
+An authorized human analyst should validate them
+before operational use.
+
+</div>
+
+<div class="warn">
+
+<b>Method limitation:</b>
+
+Sentinel-2 is medium-resolution imagery. Seasonal,
+cloud, haze, illumination and registration differences
+may produce false positives.
 
 </div>
 
@@ -1622,7 +2012,9 @@ Scene search
 </html>
 """
 
-        return HTMLResponse(html)
+        return HTMLResponse(
+            html
+        )
 
     raise HTTPException(
         404,
