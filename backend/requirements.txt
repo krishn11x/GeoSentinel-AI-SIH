@@ -1,0 +1,10 @@
+fastapi>=0.116
+uvicorn[standard]>=0.35
+requests>=2.32
+numpy>=2.2
+opencv-python-headless>=4.10
+Pillow>=11
+rasterio>=1.4
+scikit-image>=0.25
+python-multipart>=0.0.20
+pydantic>=2.11
